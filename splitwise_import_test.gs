@@ -3,27 +3,18 @@
 // Uses a solo test group (just you) to verify expenses look
 // correct before running against the real shared group.
 //
-// Paste into Tools > Script editor in your Google Sheet.
+// IMPORTANT: Keep this file in the same Apps Script project
+// as splitwise_import.gs. It intentionally re-uses the
+// constants declared there (SPLITWISE_API_KEY, COL,
+// DATA_START_ROW) — do not redeclare them here.
 // ============================================================
 
-// --- CONFIGURATION ---
-const SPLITWISE_API_KEY  = "YOUR_API_KEY_HERE";
-const TEST_GROUP_ID      = "YOUR_TEST_GROUP_ID_HERE";  // group with only you in it
-const MY_USER_ID         = "YOUR_USER_ID_HERE";
+// --- TEST-SPECIFIC CONFIG ---
+const TEST_GROUP_ID = "YOUR_TEST_GROUP_ID_HERE";  // group with only you in it
 
-// Column indices (1-based)
-const COL = {
-  supplyPeriod: 1,   // A
-  dueDate:      2,   // B
-  type:         3,   // C
-  adamShare:    4,   // D
-  ivyShare:     5,   // E
-  myShare:      6,   // F
-  total:        7,   // G
-  imported:     12,  // L — separate column from production (K) so markers don't clash
-};
-
-const DATA_START_ROW = 2;
+// Column L for the test import marker, separate from
+// production's column K so they don't interfere.
+const TEST_IMPORTED_COL = 12;  // L
 
 // ============================================================
 
@@ -36,7 +27,7 @@ function importToSplitwiseTest() {
     return;
   }
 
-  const rows = sheet.getRange(DATA_START_ROW, 1, lastRow - DATA_START_ROW + 1, 12).getValues();
+  const rows = sheet.getRange(DATA_START_ROW, 1, lastRow - DATA_START_ROW + 1, TEST_IMPORTED_COL).getValues();
 
   let successCount = 0;
   let skipCount    = 0;
@@ -46,7 +37,7 @@ function importToSplitwiseTest() {
     const sheetRow = DATA_START_ROW + i;
 
     // Skip if already test-imported
-    if (row[COL.imported - 1] && row[COL.imported - 1].toString().includes("Test ✓")) {
+    if (row[TEST_IMPORTED_COL - 1] && row[TEST_IMPORTED_COL - 1].toString().includes("Test ✓")) {
       skipCount++;
       return;
     }
@@ -54,10 +45,7 @@ function importToSplitwiseTest() {
     const supplyPeriod = row[COL.supplyPeriod - 1].toString().trim();
     const dueDateRaw   = row[COL.dueDate - 1];
     const type         = row[COL.type - 1].toString().trim();
-    const adamShare    = parseFloat(row[COL.adamShare - 1]) || 0;
-    const ivyShare     = parseFloat(row[COL.ivyShare - 1]) || 0;
-    const myShare      = parseFloat(row[COL.myShare - 1]) || 0;
-    const total        = parseFloat(row[COL.total - 1]) || 0;
+    const total        = Math.round(parseFloat(row[COL.total - 1]) * 100) / 100;
 
     if (!type || total === 0) {
       skipCount++;
@@ -67,18 +55,25 @@ function importToSplitwiseTest() {
     const dueDate     = parseDueDate(dueDateRaw);
     const description = `[TEST] ${type} - ${capitalise(supplyPeriod)}`;
 
-    // In a solo group, you are both the payer and the only person who owes.
-    // We record the full total as paid and owed by you, so the expense
-    // still shows the real amount without involving anyone else.
-    const payload = {
-      cost:             total.toFixed(2),
-      description:      description,
-      date:             dueDate,
-      currency_code:    "AUD",
-      group_id:         TEST_GROUP_ID,
-      split_equally:    false,
+    const CATEGORY_IDS = {
+      "Electricity": 5,
+      "NBN":         8,
+    };
+    const categoryId = CATEGORY_IDS[type] || 18;  // 18 = General fallback
 
-      users__0__user_id:    MY_USER_ID,
+    // In a solo group, you are both the payer and the only person who owes.
+    // The full total is recorded as paid and owed by you so the expense
+    // shows the real amount without involving anyone else.
+    const payload = {
+      cost:          total.toFixed(2),
+      description:   description,
+      date:          dueDate,
+      // No currency_code — use the group's default currency.
+      category_id:   categoryId,
+      group_id:      TEST_GROUP_ID,
+      split_equally: false,
+
+      users__0__user_id:    USER_IDS.me,
       users__0__paid_share: total.toFixed(2),
       users__0__owed_share: total.toFixed(2),
     };
@@ -94,12 +89,14 @@ function importToSplitwiseTest() {
         muteHttpExceptions: true,
       });
 
-      const result = JSON.parse(response.getContentText());
+      const result    = JSON.parse(response.getContentText());
+      const hasErrors = result.errors && Object.keys(result.errors).length > 0;
+      const expense   = result.expenses && result.expenses[0];
 
-      if (result.errors && Object.keys(result.errors).length > 0) {
+      if (hasErrors) {
         errors.push(`Row ${sheetRow} (${description}): ${JSON.stringify(result.errors)}`);
-      } else if (result.expense && result.expense.id) {
-        sheet.getRange(sheetRow, COL.imported).setValue("Test ✓");
+      } else if (expense && expense.id) {
+        sheet.getRange(sheetRow, TEST_IMPORTED_COL).setValue("Test ✓");
         successCount++;
       } else {
         errors.push(`Row ${sheetRow} (${description}): unexpected response — ${response.getContentText()}`);
@@ -117,35 +114,4 @@ function importToSplitwiseTest() {
     summary += `\n\n⚠️ ${errors.length} error(s):\n` + errors.join("\n");
   }
   SpreadsheetApp.getUi().alert(summary);
-}
-
-// ---- Helpers ----
-
-function parseDueDate(raw) {
-  if (raw instanceof Date) {
-    return Utilities.formatDate(raw, Session.getScriptTimeZone(), "yyyy-MM-dd");
-  }
-  const parts = raw.toString().trim().split("/");
-  if (parts.length === 3) {
-    return `${parts[2]}-${parts[1].padStart(2, "0")}-${parts[0].padStart(2, "0")}`;
-  }
-  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd");
-}
-
-function capitalise(str) {
-  return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
-}
-
-function encodePayload(obj) {
-  return Object.entries(obj)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join("&");
-}
-
-function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu("Splitwise")
-    .addItem("Import outstanding bills", "importToSplitwise")          // production
-    .addItem("TEST: Import to solo group", "importToSplitwiseTest")    // test
-    .addToUi();
 }
