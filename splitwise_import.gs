@@ -58,10 +58,7 @@ function importToSplitwise() {
     const supplyPeriod = row[COL.supplyPeriod - 1].toString().trim();
     const dueDateRaw   = row[COL.dueDate - 1];
     const type         = row[COL.type - 1].toString().trim();
-    const adamShare    = parseFloat(row[COL.adamShare - 1]) || 0;
-    const ivyShare     = parseFloat(row[COL.ivyShare - 1]) || 0;
-    const myShare      = parseFloat(row[COL.myShare - 1]) || 0;
-    const total        = parseFloat(row[COL.total - 1]) || 0;
+    const total        = Math.round(parseFloat(row[COL.total - 1]) * 100) / 100;
 
     // Skip rows with no usable data
     if (!type || total === 0) {
@@ -69,21 +66,36 @@ function importToSplitwise() {
       return;
     }
 
+    // Round two shares from the sheet; derive the third as the remainder
+    // so the three values always sum to exactly the total, avoiding the
+    // "owed shares don't match total cost" error from floating point drift.
+    const adamShare = Math.round(parseFloat(row[COL.adamShare - 1]) * 100) / 100;
+    const ivyShare  = Math.round(parseFloat(row[COL.ivyShare - 1])  * 100) / 100;
+    const myShare   = Math.round((total - adamShare - ivyShare) * 100) / 100;
+
     // Parse due date — handles Date objects and "DD/MM/YYYY" strings
     const dueDate = parseDueDate(dueDateRaw);
 
     const description = `${type} - ${capitalise(supplyPeriod)}`;
 
-    const payload = {
-      cost:              total.toFixed(2),
-      description:       description,
-      date:              dueDate,               // ISO 8601: "YYYY-MM-DD"
-      currency_code:     "AUD",
-      group_id:          GROUP_ID,
-      split_equally:     false,
+    const CATEGORY_IDS = {
+      "Electricity": 5,
+      "NBN":         8,
+    };
+    const categoryId = CATEGORY_IDS[type] || 18;  // 18 = General fallback
 
-      // Who paid — adjust if the bill payer rotates
-      // Splitwise requires paid_by_<n> + owed_share_<n> for each user
+    const payload = {
+      cost:          total.toFixed(2),
+      description:   description,
+      date:          dueDate,          // ISO 8601: "YYYY-MM-DD"
+      // No currency_code — lets Splitwise use the group's default currency
+      // rather than triggering a conversion to USD.
+      category_id:   categoryId,
+      group_id:      GROUP_ID,
+      split_equally: false,
+
+      // Splitwise requires paid_share + owed_share for each user.
+      // You paid the full bill; Adam and Ivy owe their shares back to you.
       users__0__user_id:    USER_IDS.me,
       users__0__paid_share: total.toFixed(2),
       users__0__owed_share: myShare.toFixed(2),
@@ -110,10 +122,14 @@ function importToSplitwise() {
 
       const result = JSON.parse(response.getContentText());
 
-      if (result.errors && Object.keys(result.errors).length > 0) {
+      // The API returns "expenses" (plural array) on success, not "expense".
+      // An empty errors object ({}) means success; a populated one means failure.
+      const hasErrors = result.errors && Object.keys(result.errors).length > 0;
+      const expense   = result.expenses && result.expenses[0];
+
+      if (hasErrors) {
         errors.push(`Row ${sheetRow} (${description}): ${JSON.stringify(result.errors)}`);
-      } else if (result.expense && result.expense.id) {
-        // Mark as imported in column K
+      } else if (expense && expense.id) {
         sheet.getRange(sheetRow, COL.imported).setValue("Imported ✓");
         successCount++;
       } else {
@@ -170,10 +186,14 @@ function encodePayload(obj) {
     .join("&");
 }
 
-// ---- Optional: adds a menu item in the sheet UI ----
+// ---- Adds menu items in the sheet UI ----
+// onOpen must only be declared once across the whole project.
+// The test menu item calls importToSplitwiseTest() defined in
+// splitwise_import_test.gs.
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("Splitwise")
     .addItem("Import outstanding bills", "importToSplitwise")
+    .addItem("TEST: Import to solo group", "importToSplitwiseTest")
     .addToUi();
 }
